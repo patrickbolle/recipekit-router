@@ -391,7 +391,7 @@ export default {
 			const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout for embedded
 
 			try {
-				const response = await fetch(modifiedRequest, {
+				let response = await fetch(modifiedRequest, {
 					signal: controller.signal
 				});
 
