@@ -69,6 +69,37 @@ export default {
 			// Check 2: Look for beta cookies (shop-specific or for assets)
 			const cookies = request.headers.get("Cookie") || "";
 
+			// Function to verify beta status from database (with timeout for safety)
+			const verifyBetaStatus = async (shopDomain) => {
+				const controller = new AbortController();
+				const timeoutId = setTimeout(() => controller.abort(), 2000); // 2 second timeout
+
+				try {
+					const prefsUrl = `https://app.getrecipekit.com/api/user-preferences?shop=${encodeURIComponent(shopDomain)}`;
+					const prefsResponse = await fetch(prefsUrl, {
+						headers: {
+							"X-Forwarded-Host": "recipe-kit-router.recipekit.workers.dev",
+							"X-Forwarded-Proto": "https"
+						},
+						signal: controller.signal
+					});
+					clearTimeout(timeoutId);
+
+					if (prefsResponse.ok) {
+						const data = await prefsResponse.json();
+						return data.beta_app_enabled === true;
+					}
+				} catch (e) {
+					clearTimeout(timeoutId);
+					if (e.name === 'AbortError') {
+						console.error("Beta status verification timed out - trusting cookie");
+					} else {
+						console.error("Failed to verify beta status:", e);
+					}
+				}
+				return null; // Unknown - don't change behavior, trust the cookie
+			};
+
 			// Extract shop from cookie if not in URL (for assets)
 			let shopFromCookie = null;
 			const shopCookieMatch = cookies.match(/shopify-shop=([^;]+)/);
@@ -138,6 +169,26 @@ export default {
 			if (!effectiveShop) {
 				console.log("No shop detected in URL or cookies - defaulting to old app");
 				shouldUseBeta = false;
+			}
+
+			// CRITICAL: For page loads (not assets), if we think beta is enabled via cookie,
+			// verify against the database to handle cases where user disabled beta but cookie persists
+			const isPageLoad = (url.pathname === "/" || url.pathname === "") && !isNextAsset && !url.pathname.startsWith("/_nuxt/");
+			let shouldClearBetaCookie = false; // Track if we need to clear the stale cookie
+
+			if (shouldUseBeta && hasShopBetaCookie && isPageLoad && effectiveShop && !hasBetaFlag) {
+				console.log(`Beta cookie exists for ${effectiveShop}, verifying against database...`);
+				const dbBetaEnabled = await verifyBetaStatus(effectiveShop);
+
+				if (dbBetaEnabled === false) {
+					console.log(`Database says beta is DISABLED for ${effectiveShop}. Overriding cookie and routing to old app.`);
+					shouldUseBeta = false;
+					shouldClearBetaCookie = true; // Mark for cookie clearing
+				} else if (dbBetaEnabled === true) {
+					console.log(`Database confirms beta is enabled for ${effectiveShop}.`);
+				} else {
+					console.log(`Could not verify beta status for ${effectiveShop}, trusting cookie.`);
+				}
 			}
 
 			// Check if request is embedded
@@ -398,6 +449,42 @@ export default {
 					console.error(`Beta app error: ${response.status} - falling back to old app`);
 					throw new Error("Beta app returned error");
 				}
+
+				// Special handling for /api/user-preferences response
+				// If the database says beta is disabled but we have a beta cookie, clear it
+				if (url.pathname === '/api/user-preferences' && response.ok) {
+					try {
+						const responseClone = response.clone();
+						const prefsData = await responseClone.json();
+
+						if (prefsData.beta_app_enabled === false && effectiveShop) {
+							const cookieName = `beta_${effectiveShop.replace(/\./g, "_")}`;
+							const hasBetaCookie = cookies.includes(`${cookieName}=true`);
+
+							if (hasBetaCookie) {
+								console.log(`Database says beta disabled for ${effectiveShop}, but cookie exists. Clearing cookie.`);
+								// We need to modify the response to include the Set-Cookie header
+								const modifiedPrefsResponse = new Response(JSON.stringify(prefsData), response);
+								modifiedPrefsResponse.headers.set("Content-Type", "application/json");
+								modifiedPrefsResponse.headers.append("Set-Cookie", `${cookieName}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; SameSite=None`);
+
+								if (isEmbedded) {
+									modifiedPrefsResponse.headers.set(
+										"Content-Security-Policy",
+										`frame-ancestors https://${shopForRouting} https://admin.shopify.com;`
+									);
+									modifiedPrefsResponse.headers.delete("X-Frame-Options");
+									modifiedPrefsResponse.headers.delete("x-frame-options");
+								}
+
+								return modifiedPrefsResponse;
+							}
+						}
+					} catch (jsonError) {
+						console.error("Failed to parse user-preferences response:", jsonError);
+						// Continue with normal response handling
+					}
+				}
 				
 				// Handle redirects - just pass them through with proper CSP
 				if (response.status >= 300 && response.status < 400) {
@@ -452,12 +539,12 @@ export default {
 				// Handle beta cookies based on flags
 				if (effectiveShop) {
 					const cookieName = `beta_${effectiveShop.replace(/\./g, "_")}`;
-					
-					// Clear beta cookie if beta is explicitly disabled
-					if (hasBetaDisableFlag) {
-						console.log(`Clearing beta cookie for shop: ${effectiveShop} (explicitly disabled)`);
+
+					// Clear beta cookie if beta is explicitly disabled OR if database says it's disabled
+					if (hasBetaDisableFlag || shouldClearBetaCookie) {
+						console.log(`Clearing beta cookie for shop: ${effectiveShop} (${hasBetaDisableFlag ? 'explicitly disabled' : 'database override'})`);
 						// Set cookie with Max-Age=0 to delete it
-						modifiedResponse.headers.append("Set-Cookie", `${cookieName}=false; Path=/; Secure; SameSite=None; Max-Age=0`);
+						modifiedResponse.headers.append("Set-Cookie", `${cookieName}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; SameSite=None`);
 					}
 					// Set beta cookie ONLY if beta was explicitly enabled via URL flag
 					else if (shouldUseBeta && hasBetaFlag) {
