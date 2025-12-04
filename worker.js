@@ -181,9 +181,24 @@ export default {
 				const dbBetaEnabled = await verifyBetaStatus(effectiveShop);
 
 				if (dbBetaEnabled === false) {
-					console.log(`Database says beta is DISABLED for ${effectiveShop}. Overriding cookie and routing to old app.`);
-					shouldUseBeta = false;
-					shouldClearBetaCookie = true; // Mark for cookie clearing
+					console.log(`Database says beta is DISABLED for ${effectiveShop}. Redirecting to clear cache and cookie.`);
+
+					// Instead of just routing, do a redirect with cache-busting to force browser to clear cached Next.js assets
+					const cookieName = `beta_${effectiveShop.replace(/\./g, "_")}`;
+					const redirectUrl = new URL(url);
+					redirectUrl.searchParams.set('_nocache', Date.now().toString());
+					redirectUrl.searchParams.set('beta_disabled', 'true');
+
+					return new Response(null, {
+						status: 302,
+						headers: {
+							'Location': redirectUrl.toString(),
+							'Set-Cookie': `${cookieName}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; SameSite=None`,
+							'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+							'Pragma': 'no-cache',
+							'Expires': '0'
+						}
+					});
 				} else if (dbBetaEnabled === true) {
 					console.log(`Database confirms beta is enabled for ${effectiveShop}.`);
 				} else {
