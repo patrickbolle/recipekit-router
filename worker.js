@@ -341,7 +341,7 @@ export default {
 					// API calls go to Express backend
 					console.log(`BETA USER - Routing API to backend: ${url.pathname}`);
 					// Add shop parameter if not already present (required for proxied auth)
-					const targetUrlObj = new URL(`https://sapp.recipekit.com${url.pathname}${url.search}`);
+					const targetUrlObj = new URL(`https://recipe-kit-next-server.onrender.com${url.pathname}${url.search}`);
 					if (!targetUrlObj.searchParams.has('shop') && shopForRouting) {
 						targetUrlObj.searchParams.set('shop', shopForRouting);
 					}
