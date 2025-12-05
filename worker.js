@@ -70,13 +70,15 @@ export default {
 			const cookies = request.headers.get("Cookie") || "";
 
 			// Function to verify beta status from database (with timeout for safety)
+			// Uses the public /api/beta-status endpoint which doesn't require authentication
 			const verifyBetaStatus = async (shopDomain) => {
 				const controller = new AbortController();
 				const timeoutId = setTimeout(() => controller.abort(), 2000); // 2 second timeout
 
 				try {
-					const prefsUrl = `https://app.getrecipekit.com/api/user-preferences?shop=${encodeURIComponent(shopDomain)}`;
-					const prefsResponse = await fetch(prefsUrl, {
+					// Use the public beta-status endpoint (no auth required)
+					const betaStatusUrl = `https://app.getrecipekit.com/api/beta-status?shop=${encodeURIComponent(shopDomain)}`;
+					const betaResponse = await fetch(betaStatusUrl, {
 						headers: {
 							"X-Forwarded-Host": "recipe-kit-router.recipekit.workers.dev",
 							"X-Forwarded-Proto": "https"
@@ -85,9 +87,12 @@ export default {
 					});
 					clearTimeout(timeoutId);
 
-					if (prefsResponse.ok) {
-						const data = await prefsResponse.json();
+					if (betaResponse.ok) {
+						const data = await betaResponse.json();
+						console.log(`Beta status for ${shopDomain}: ${data.beta_app_enabled}`);
 						return data.beta_app_enabled === true;
+					} else {
+						console.error(`Beta status check failed with status: ${betaResponse.status}`);
 					}
 				} catch (e) {
 					clearTimeout(timeoutId);
