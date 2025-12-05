@@ -183,7 +183,9 @@ export default {
 			let shouldClearBetaCookie = false; // Track if we need to clear the stale cookie
 
 			// Verify beta status for any request with a beta cookie (expanded from page loads only)
-			if (shouldUseBeta && hasShopBetaCookie && effectiveShop && !hasBetaFlag) {
+			// EXCEPTION: Don't verify for /_next/ assets - if they have a beta cookie and need Next.js assets,
+			// they're already on the beta app and need those assets to render. Verifying would break the page.
+			if (shouldUseBeta && hasShopBetaCookie && effectiveShop && !hasBetaFlag && !isNextAsset) {
 				console.log(`Beta cookie exists for ${effectiveShop}, verifying against database...`);
 				const dbBetaEnabled = await verifyBetaStatus(effectiveShop);
 
