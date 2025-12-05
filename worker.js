@@ -171,34 +171,45 @@ export default {
 				shouldUseBeta = false;
 			}
 
-			// CRITICAL: For page loads (not assets), if we think beta is enabled via cookie,
+			// CRITICAL: For ANY request with a beta cookie (not just page loads),
 			// verify against the database to handle cases where user disabled beta but cookie persists
+			// This is essential because API calls like /recipes need correct routing too
 			const isPageLoad = (url.pathname === "/" || url.pathname === "") && !isNextAsset && !url.pathname.startsWith("/_nuxt/");
 			let shouldClearBetaCookie = false; // Track if we need to clear the stale cookie
 
-			if (shouldUseBeta && hasShopBetaCookie && isPageLoad && effectiveShop && !hasBetaFlag) {
+			// Verify beta status for any request with a beta cookie (expanded from page loads only)
+			if (shouldUseBeta && hasShopBetaCookie && effectiveShop && !hasBetaFlag) {
 				console.log(`Beta cookie exists for ${effectiveShop}, verifying against database...`);
 				const dbBetaEnabled = await verifyBetaStatus(effectiveShop);
 
 				if (dbBetaEnabled === false) {
-					console.log(`Database says beta is DISABLED for ${effectiveShop}. Redirecting to clear cache and cookie.`);
+					console.log(`Database says beta is DISABLED for ${effectiveShop}.`);
 
-					// Instead of just routing, do a redirect with cache-busting to force browser to clear cached Next.js assets
-					const cookieName = `beta_${effectiveShop.replace(/\./g, "_")}`;
-					const redirectUrl = new URL(url);
-					redirectUrl.searchParams.set('_nocache', Date.now().toString());
-					redirectUrl.searchParams.set('beta_disabled', 'true');
+					// Override beta flag - route to old app
+					shouldUseBeta = false;
+					shouldClearBetaCookie = true;
 
-					return new Response(null, {
-						status: 302,
-						headers: {
-							'Location': redirectUrl.toString(),
-							'Set-Cookie': `${cookieName}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; SameSite=None`,
-							'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
-							'Pragma': 'no-cache',
-							'Expires': '0'
-						}
-					});
+					// For page loads, do a redirect with cache-busting to force browser to clear cached Next.js assets
+					if (isPageLoad) {
+						console.log(`Page load detected - redirecting to clear cache and cookie.`);
+						const cookieName = `beta_${effectiveShop.replace(/\./g, "_")}`;
+						const redirectUrl = new URL(url);
+						redirectUrl.searchParams.set('_nocache', Date.now().toString());
+						redirectUrl.searchParams.set('beta_disabled', 'true');
+
+						return new Response(null, {
+							status: 302,
+							headers: {
+								'Location': redirectUrl.toString(),
+								'Set-Cookie': `${cookieName}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; SameSite=None`,
+								'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+								'Pragma': 'no-cache',
+								'Expires': '0'
+							}
+						});
+					}
+					// For API calls, just continue - we'll route to old app and clear cookie in response
+					console.log(`API call detected - routing to old app and will clear cookie in response.`);
 				} else if (dbBetaEnabled === true) {
 					console.log(`Database confirms beta is enabled for ${effectiveShop}.`);
 				} else {
