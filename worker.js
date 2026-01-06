@@ -182,10 +182,18 @@ export default {
 			const isPageLoad = (url.pathname === "/" || url.pathname === "") && !isNextAsset && !url.pathname.startsWith("/_nuxt/");
 			let shouldClearBetaCookie = false; // Track if we need to clear the stale cookie
 
+			// Check if there's a beta cookie for the effectiveShop directly
+			// This is more reliable than hasShopBetaCookie which depends on shopify-shop cookie
+			const hasBetaCookieForEffectiveShop = effectiveShop &&
+				cookies.includes(`beta_${effectiveShop.replace(/\./g, "_")}=true`);
+
 			// Verify beta status for any request with a beta cookie (expanded from page loads only)
 			// EXCEPTION: Don't verify for /_next/ assets - if they have a beta cookie and need Next.js assets,
 			// they're already on the beta app and need those assets to render. Verifying would break the page.
-			if (shouldUseBeta && hasShopBetaCookie && effectiveShop && !hasBetaFlag && !isNextAsset) {
+			// NOTE: Use hasBetaCookieForEffectiveShop instead of hasShopBetaCookie for consistency
+			// hasShopBetaCookie depends on the shopify-shop cookie which is only set by Next.js,
+			// causing a timing asymmetry where verification is skipped on first request but triggers on subsequent ones
+			if (shouldUseBeta && hasBetaCookieForEffectiveShop && effectiveShop && !hasBetaFlag && !isNextAsset) {
 				console.log(`Beta cookie exists for ${effectiveShop}, verifying against database...`);
 				const dbBetaEnabled = await verifyBetaStatus(effectiveShop);
 
