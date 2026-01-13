@@ -142,14 +142,13 @@ export default {
 			// - Allow beta redirects to rely on the cookie (hasBetaFlag)
 			// - Allow established beta sessions to keep using the cookie-derived shop (hasShopBetaCookie)
 			// - Static asset requests (_next/) never include shop, so fall back to cookie there too
-			// - Safari fallback: use shop extracted from beta cookie when other cookies are blocked
+			// - Safari fallback for assets: use shop from beta cookie when other cookies blocked
 			const isNextAsset = url.pathname.startsWith("/_next/");
 			const effectiveShop =
 				shop ||
 				(hasBetaFlag ? shopFromCookie : null) ||
 				(hasShopBetaCookie ? shopFromCookie : null) ||
-				(isNextAsset ? shopFromCookie : null) ||
-				(hasAnyBetaCookie ? (shopFromCookie || shopFromBetaCookie) : null);
+				(isNextAsset ? (shopFromCookie || shopFromBetaCookie) : null);
 			
 			// Check if beta should be enabled via flags or cookies
 			// IMPORTANT: Only enable beta if explicitly requested via URL flag or valid cookie
@@ -190,11 +189,14 @@ export default {
 				}
 			}
 
-			// Safari fallback: if we have a beta cookie but standard checks failed,
-			// enable beta using the shop extracted from the beta cookie
-			if (!shouldUseBeta && !hasBetaDisableFlag && hasAnyBetaCookie && shopFromBetaCookie) {
+			// Safari fallback: ONLY for /_next/ assets, if we have a beta cookie but
+			// standard checks failed, enable beta. We limit this to assets because:
+			// 1. Safari ITP may prevent cookie clearing, leaving stale beta cookies
+			// 2. For page navigation, we should respect the database/explicit disable
+			// 3. Assets with /_next/ prefix can ONLY come from Next.js app
+			if (!shouldUseBeta && !hasBetaDisableFlag && hasAnyBetaCookie && isNextAsset) {
 				shouldUseBeta = true;
-				console.log(`Safari fallback: Beta enabled via extracted shop from beta cookie: ${shopFromBetaCookie}`);
+				console.log(`Safari fallback (assets only): Beta enabled for /_next/ path`);
 			}
 
 			// If no shop is detected (shouldn't happen), default to old app
