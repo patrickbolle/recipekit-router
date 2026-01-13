@@ -69,6 +69,11 @@ export default {
 			// Check 2: Look for beta cookies (shop-specific or for assets)
 			const cookies = request.headers.get("Cookie") || "";
 
+			// Check if ANY beta cookie exists (pattern: beta_*=true)
+			// This is a fallback for Safari where ITP may block specific cookie matching
+			// but we can still detect if user has ANY beta cookie set
+			const hasAnyBetaCookie = /beta_[^=]+=true/.test(cookies);
+
 			// Function to verify beta status from database (with timeout for safety)
 			// Uses the public /api/beta-status endpoint which doesn't require authentication
 			const verifyBetaStatus = async (shopDomain) => {
@@ -349,9 +354,13 @@ export default {
 				console.log(`Routing Nuxt asset to old app: ${url.pathname}`);
 				targetUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
 			}
-			// SPECIAL CASE: /_next/ assets for beta users go to Next.js app
-			else if (url.pathname.startsWith("/_next/") && shouldUseBeta) {
-				console.log(`Routing Next.js asset to beta app: ${url.pathname}`);
+			// SPECIAL CASE: /_next/ assets go to Next.js app IF there's any beta indication
+			// We check shouldUseBeta OR hasAnyBetaCookie because:
+			// 1. Safari's ITP blocks SameSite=None cookies in embedded iframes
+			// 2. hasAnyBetaCookie catches cases where shop-specific matching fails
+			// 3. Without either, we default to Nuxt app (principle: default to production)
+			else if (url.pathname.startsWith("/_next/") && (shouldUseBeta || hasAnyBetaCookie)) {
+				console.log(`Routing Next.js asset to Next.js app: ${url.pathname} (shouldUseBeta=${shouldUseBeta}, hasAnyBetaCookie=${hasAnyBetaCookie})`);
 				targetUrl = `https://app.recipekit.com${url.pathname}${url.search}`;
 			}
 			// Static assets (images, fonts, CDN paths, etc) should go to old app where they're hosted
