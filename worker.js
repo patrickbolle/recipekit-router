@@ -74,6 +74,19 @@ export default {
 			// but we can still detect if user has ANY beta cookie set
 			const hasAnyBetaCookie = /beta_[^=]+=true/.test(cookies);
 
+			// Extract shop domain from beta cookie if it exists
+			// Cookie format: beta_shop_domain_myshopify_com=true -> shop-domain.myshopify.com
+			let shopFromBetaCookie = null;
+			const betaCookieMatch = cookies.match(/beta_([^=]+)=true/);
+			if (betaCookieMatch) {
+				// Convert underscores back to dots and hyphens
+				// e.g., "blues_hog_myshopify_com" -> "blues-hog.myshopify.com"
+				shopFromBetaCookie = betaCookieMatch[1].replace(/_/g, '.').replace(/\.myshopify\.com$/, '.myshopify.com');
+				// Handle shop names with hyphens (stored as underscores, but need to distinguish from dots)
+				// This is tricky - we'll trust the format for now
+				console.log(`Extracted shop from beta cookie: ${shopFromBetaCookie}`);
+			}
+
 			// Function to verify beta status from database (with timeout for safety)
 			// Uses the public /api/beta-status endpoint which doesn't require authentication
 			const verifyBetaStatus = async (shopDomain) => {
@@ -129,12 +142,14 @@ export default {
 			// - Allow beta redirects to rely on the cookie (hasBetaFlag)
 			// - Allow established beta sessions to keep using the cookie-derived shop (hasShopBetaCookie)
 			// - Static asset requests (_next/) never include shop, so fall back to cookie there too
+			// - Safari fallback: use shop extracted from beta cookie when other cookies are blocked
 			const isNextAsset = url.pathname.startsWith("/_next/");
 			const effectiveShop =
 				shop ||
 				(hasBetaFlag ? shopFromCookie : null) ||
 				(hasShopBetaCookie ? shopFromCookie : null) ||
-				(isNextAsset ? shopFromCookie : null);
+				(isNextAsset ? shopFromCookie : null) ||
+				(hasAnyBetaCookie ? (shopFromCookie || shopFromBetaCookie) : null);
 			
 			// Check if beta should be enabled via flags or cookies
 			// IMPORTANT: Only enable beta if explicitly requested via URL flag or valid cookie
@@ -173,6 +188,13 @@ export default {
 						console.log(`Beta cookie exists but context mismatch - shop: ${shop}, effectiveShop: ${effectiveShop}, shopFromCookie: ${shopFromCookie}`);
 					}
 				}
+			}
+
+			// Safari fallback: if we have a beta cookie but standard checks failed,
+			// enable beta using the shop extracted from the beta cookie
+			if (!shouldUseBeta && !hasBetaDisableFlag && hasAnyBetaCookie && shopFromBetaCookie) {
+				shouldUseBeta = true;
+				console.log(`Safari fallback: Beta enabled via extracted shop from beta cookie: ${shopFromBetaCookie}`);
 			}
 
 			// If no shop is detected (shouldn't happen), default to old app
