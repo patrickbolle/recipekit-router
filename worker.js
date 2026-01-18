@@ -145,9 +145,12 @@ export default {
 			                         "/functions", "/resources", "/install", "/billing", "/auth", "/api/apps"];
 			const isBackendApi = useNextjs && backendApiPaths.some(p => url.pathname.startsWith(p));
 
-			// Analytics data endpoints (not OAuth) can go to backend
-			const isAnalyticsData = useNextjs && url.pathname.startsWith("/analytics") &&
+			// Analytics API endpoints go to backend, but /analytics page goes to Next.js
+			// /analytics (exact) = page request → Next.js
+			// /analytics/* (with path segments like /dashboard/:shop) = API → Express
+			const isAnalyticsApi = useNextjs && url.pathname.startsWith("/analytics/") &&
 				!url.pathname.startsWith("/analytics/enable") && !url.pathname.startsWith("/analytics/scopes");
+			// Note: /analytics (exact match, no trailing content) is NOT an API - it's the page
 
 			if (isNuxtAsset) {
 				targetUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
@@ -156,7 +159,7 @@ export default {
 			} else if (isLegacyOnly || isStaticAsset) {
 				targetUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
 			} else if (useNextjs && isAllowedPath) {
-				if (isBackendApi || isAnalyticsData) {
+				if (isBackendApi || isAnalyticsApi) {
 					const apiUrl = new URL(`https://recipe-kit-next-server.onrender.com${url.pathname}${url.search}`);
 					if (!apiUrl.searchParams.has('shop') && effectiveShop) {
 						apiUrl.searchParams.set('shop', effectiveShop);
