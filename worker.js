@@ -1,25 +1,67 @@
-// TEST VERSION - Cloudflare Worker for beta.getrecipekit.com
-// Deploy this to beta.getrecipekit.com for testing beta redirect
+// Cloudflare Worker for RecipeKit
+// Routes traffic between Next.js (primary) and Nuxt (legacy) apps
 //
-// IMPORTANT PRINCIPLE: The Nuxt app is production and takes priority
-// When in doubt about routing, default to the Nuxt app to ensure stability
-// The Next.js app is still in beta/migration phase
+// ROUTING LOGIC (in priority order):
+// 1. URL flags (?use_nextjs=true or ?use_nuxt=true) - explicit override
+// 2. Routing cookie (routing_SHOP=nextjs|nuxt) - cached preference
+// 3. Database check (first visit only) - shop's preference
+// 4. Default: Next.js
+//
+// LEGACY COMPATIBILITY:
+// - Old beta_SHOP=true cookies are treated as routing_SHOP=nextjs
+// - Old ?beta_enabled=true/false params still work
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+const shopToCookieName = (shop) => shop ? `routing_${shop.replace(/\./g, "_")}` : null;
+const legacyBetaCookieName = (shop) => shop ? `beta_${shop.replace(/\./g, "_")}` : null;
+
+const setCSPHeaders = (response, shop) => {
+	if (!shop) return;
+	// Validate shop domain format to prevent CSP injection
+	if (!/^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$/.test(shop)) {
+		console.error(`[Router] Invalid shop domain format: ${shop}`);
+		return;
+	}
+	response.headers.set(
+		"Content-Security-Policy",
+		`frame-ancestors https://${shop} https://admin.shopify.com;`
+	);
+	response.headers.delete("X-Frame-Options");
+	response.headers.delete("x-frame-options");
+};
+
+const createFallbackResponse = async (url, method, headers, body, shop, isEmbedded) => {
+	const fallbackUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
+	const response = await fetch(new Request(fallbackUrl, { method, headers, body }));
+	const modified = new Response(response.body, response);
+	if (isEmbedded) setCSPHeaders(modified, shop);
+	return modified;
+};
+
+// ============================================================================
+// MAIN HANDLER
+// ============================================================================
 
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
-		
-		// Clone the request body early if it's a POST/PUT/PATCH since we might need it multiple times
+		const cookies = request.headers.get("Cookie") || "";
+
+		// Clone request for POST/PUT/PATCH (may need for retry on fallback)
+		// Use arrayBuffer to preserve binary data (important for file uploads)
 		let requestBody = null;
-		if (request.method === 'POST' || request.method === 'PUT' || request.method === 'PATCH') {
+		if (['POST', 'PUT', 'PATCH'].includes(request.method)) {
 			try {
-				requestBody = await request.text();
+				requestBody = await request.arrayBuffer();
 			} catch (e) {
-				console.error("Failed to read request body:", e);
+				console.error("[Router] Failed to read request body:", e);
 			}
 		}
-		
-		// Handle CORS preflight requests
+
+		// Handle CORS preflight
 		if (request.method === "OPTIONS") {
 			return new Response(null, {
 				status: 200,
@@ -32,662 +74,248 @@ export default {
 			});
 		}
 
-		// For testing, log all incoming requests
-		const cookieHeader = request.headers.get("Cookie") || "";
-		const shopFromUrl = url.searchParams.get("shop");
-		const shopifyShopCookie = cookieHeader.match(/shopify-shop=([^;]+)/)?.[1];
-
-		console.log("TEST WORKER - Request received:", {
-			url: url.toString(),
-			path: url.pathname,
-			shopFromUrl,
-			shopifyShopCookie,
-			hasBetaFlag: url.searchParams.has("beta_enabled"),
-			relevantBetaCookie: shopFromUrl
-				? cookieHeader.includes(`beta_${shopFromUrl.replace(/\./g, "_")}=true`)
-				: shopifyShopCookie
-					? cookieHeader.includes(`beta_${shopifyShopCookie.replace(/\./g, "_")}=true`)
-					: false
-		});
+		// ========================================================================
+		// VARIABLES (declared here so they're accessible in catch block)
+		// ========================================================================
+		let shop = url.searchParams.get("shop") || "";
+		let shopFromCookie = cookies.match(/shopify-shop=([^;]+)/)?.[1] || null;
+		let effectiveShop = shop || shopFromCookie;
+		let isEmbedded = url.searchParams.get("embedded") === "1";
+		let useNextjs = true; // Default to Next.js
+		let cookieToSet = null; // Track cookie changes
 
 		try {
-			// SAFETY: Always default to old app if anything is uncertain
-			let shouldUseBeta = false;
+			// ====================================================================
+			// STEP 1: DETERMINE ROUTING PREFERENCE
+			// ====================================================================
 
-			// Get shop from URL
-			const shop = url.searchParams.get("shop") || "";
+			// Priority 1: URL flags (explicit override)
+			const urlWantsNextjs = url.searchParams.get("beta_enabled") === "true" ||
+			                       url.searchParams.get("use_nextjs") === "true";
+			const urlWantsNuxt = url.searchParams.get("beta_enabled") === "false" ||
+			                     url.searchParams.get("beta_disabled") !== null ||
+			                     url.searchParams.get("use_nuxt") === "true";
 
-			// Check 1: Look for beta flag in URL (from redirect)
-			// Note: We'll handle this after we determine the effective shop
-			const hasBetaFlag = url.searchParams.get("beta_enabled") === "true" || url.searchParams.get("from_beta_redirect") === "true";
-			const hasBetaDisableFlag = url.searchParams.get("beta_enabled") === "false" || url.searchParams.has("beta_disabled");
-			
-			// Check if this is a return from Shopify pricing page (charge acceptance flow)
-			const hasChargeId = url.searchParams.has("charge_id");
-			const isChargePath = hasChargeId && (url.pathname === "/" || url.pathname === "");
+			if (urlWantsNuxt) {
+				useNextjs = false;
+				if (effectiveShop) cookieToSet = { shop: effectiveShop, value: "nuxt" };
+				console.log(`[Router] URL flag requests Nuxt for ${effectiveShop}`);
+			} else if (urlWantsNextjs) {
+				useNextjs = true;
+				if (effectiveShop) cookieToSet = { shop: effectiveShop, value: "nextjs" };
+				console.log(`[Router] URL flag requests Next.js for ${effectiveShop}`);
+			} else if (effectiveShop) {
+				// Priority 2: Check for routing cookie
+				const cookieName = shopToCookieName(effectiveShop);
+				const cookieMatch = cookies.match(new RegExp(`${cookieName}=(nextjs|nuxt)`));
 
-			// Check 2: Look for beta cookies (shop-specific or for assets)
-			const cookies = request.headers.get("Cookie") || "";
-
-			// Check if ANY beta cookie exists (pattern: beta_*=true)
-			// This is a fallback for Safari where ITP may block specific cookie matching
-			// but we can still detect if user has ANY beta cookie set
-			const hasAnyBetaCookie = /beta_[^=]+=true/.test(cookies);
-
-			// Extract shop domain from beta cookie if it exists
-			// Cookie format: beta_shop_domain_myshopify_com=true -> shop-domain.myshopify.com
-			let shopFromBetaCookie = null;
-			const betaCookieMatch = cookies.match(/beta_([^=]+)=true/);
-			if (betaCookieMatch) {
-				// Convert underscores back to dots and hyphens
-				// e.g., "blues_hog_myshopify_com" -> "blues-hog.myshopify.com"
-				shopFromBetaCookie = betaCookieMatch[1].replace(/_/g, '.').replace(/\.myshopify\.com$/, '.myshopify.com');
-				// Handle shop names with hyphens (stored as underscores, but need to distinguish from dots)
-				// This is tricky - we'll trust the format for now
-				console.log(`Extracted shop from beta cookie: ${shopFromBetaCookie}`);
-			}
-
-			// Function to verify beta status from database (with timeout for safety)
-			// Uses the public /api/beta-status endpoint which doesn't require authentication
-			const verifyBetaStatus = async (shopDomain) => {
-				const controller = new AbortController();
-				const timeoutId = setTimeout(() => controller.abort(), 2000); // 2 second timeout
-
-				try {
-					// Use the public beta-status endpoint (no auth required)
-					const betaStatusUrl = `https://app.getrecipekit.com/api/beta-status?shop=${encodeURIComponent(shopDomain)}`;
-					const betaResponse = await fetch(betaStatusUrl, {
-						headers: {
-							"X-Forwarded-Host": "recipe-kit-router.recipekit.workers.dev",
-							"X-Forwarded-Proto": "https"
-						},
-						signal: controller.signal
-					});
-					clearTimeout(timeoutId);
-
-					if (betaResponse.ok) {
-						const data = await betaResponse.json();
-						console.log(`Beta status for ${shopDomain}: ${data.beta_app_enabled}`);
-						return data.beta_app_enabled === true;
-					} else {
-						console.error(`Beta status check failed with status: ${betaResponse.status}`);
-					}
-				} catch (e) {
-					clearTimeout(timeoutId);
-					if (e.name === 'AbortError') {
-						console.error("Beta status verification timed out - trusting cookie");
-					} else {
-						console.error("Failed to verify beta status:", e);
-					}
-				}
-				return null; // Unknown - don't change behavior, trust the cookie
-			};
-
-			// Extract shop from cookie if not in URL (for assets)
-			let shopFromCookie = null;
-			const shopCookieMatch = cookies.match(/shopify-shop=([^;]+)/);
-			if (shopCookieMatch) {
-				shopFromCookie = shopCookieMatch[1];
-			}
-
-			// For routing decisions where we need a shop (like adding to API URLs), we can use the cookie
-			const shopForRouting = shop || shopFromCookie;
-			
-			// Determine whether the cookie indicates beta for the cookie-derived shop
-			const cookieShopBetaName = shopFromCookie ? `beta_${shopFromCookie.replace(/\./g, "_")}=true` : null;
-			const hasShopBetaCookie = cookieShopBetaName ? cookies.includes(cookieShopBetaName) : false;
-			
-			// Determine effective shop for beta detection
-			// - Prefer explicit shop from URL when present
-			// - Allow beta redirects to rely on the cookie (hasBetaFlag)
-			// - Allow established beta sessions to keep using the cookie-derived shop (hasShopBetaCookie)
-			// - Static asset requests (_next/) never include shop, so fall back to cookie there too
-			// - Safari fallback for assets: use shop from beta cookie when other cookies blocked
-			const isNextAsset = url.pathname.startsWith("/_next/");
-			const effectiveShop =
-				shop ||
-				(hasBetaFlag ? shopFromCookie : null) ||
-				(hasShopBetaCookie ? shopFromCookie : null) ||
-				(isNextAsset ? (shopFromCookie || shopFromBetaCookie) : null);
-			
-			// Check if beta should be enabled via flags or cookies
-			// IMPORTANT: Only enable beta if explicitly requested via URL flag or valid cookie
-			// But if beta is explicitly disabled, respect that
-			if (hasBetaDisableFlag && effectiveShop) {
-				shouldUseBeta = false;
-				console.log("Beta explicitly DISABLED for shop:", effectiveShop);
-			} else if (hasBetaFlag && effectiveShop) {
-				shouldUseBeta = true;
-				console.log("Beta flag detected in URL for shop:", effectiveShop);
-			} else if (hasShopBetaCookie && effectiveShop === shopFromCookie && !hasBetaDisableFlag) {
-				// Only trust cookie if the shop matches - prevent cross-shop beta activation
-				shouldUseBeta = true;
-				console.log("Beta cookie detected for matching shop:", effectiveShop);
-			}
-			
-			// Note: charge_id can come from EITHER old or new app, so we don't make routing 
-			// decisions based on it - we rely on the cookie as the source of truth
-			
-			// Check for shop-specific beta cookie - ONLY for the current shop
-			// This is a secondary check - the shop must match exactly
-			if (effectiveShop && !shouldUseBeta && !hasBetaDisableFlag) {
-				const cookieName = `beta_${effectiveShop.replace(/\./g, "_")}=true`;
-				if (cookies.includes(cookieName)) {
-					// Additional validation: only enable if this is the right context
-					// Don't enable beta just because a cookie exists - the shop must be correct
-					console.log(`Found beta cookie for ${effectiveShop}, validating context...`);
-					
-					// Only enable beta if:
-					// 1. We have a shop in the URL that matches, OR
-					// 2. This is the shop from the cookie and we're in the right context
-					if (shop === effectiveShop || (shopFromCookie === effectiveShop && !shop)) {
-						shouldUseBeta = true;
-						console.log("Beta enabled for validated shop:", effectiveShop);
-					} else {
-						console.log(`Beta cookie exists but context mismatch - shop: ${shop}, effectiveShop: ${effectiveShop}, shopFromCookie: ${shopFromCookie}`);
-					}
-				}
-			}
-
-			// Safari fallback: ONLY for /_next/ assets, if we have a beta cookie but
-			// standard checks failed, enable beta. We limit this to assets because:
-			// 1. Safari ITP may prevent cookie clearing, leaving stale beta cookies
-			// 2. For page navigation, we should respect the database/explicit disable
-			// 3. Assets with /_next/ prefix can ONLY come from Next.js app
-			if (!shouldUseBeta && !hasBetaDisableFlag && hasAnyBetaCookie && isNextAsset) {
-				shouldUseBeta = true;
-				console.log(`Safari fallback (assets only): Beta enabled for /_next/ path`);
-			}
-
-			// If no shop is detected (shouldn't happen), default to old app
-			if (!effectiveShop) {
-				console.log("No shop detected in URL or cookies - defaulting to old app");
-				shouldUseBeta = false;
-			}
-
-			// CRITICAL: For ANY request with a beta cookie (not just page loads),
-			// verify against the database to handle cases where user disabled beta but cookie persists
-			// This is essential because API calls like /recipes need correct routing too
-			const isPageLoad = (url.pathname === "/" || url.pathname === "") && !isNextAsset && !url.pathname.startsWith("/_nuxt/");
-			let shouldClearBetaCookie = false; // Track if we need to clear the stale cookie
-
-			// Check if there's a beta cookie for the effectiveShop directly
-			// This is more reliable than hasShopBetaCookie which depends on shopify-shop cookie
-			const hasBetaCookieForEffectiveShop = effectiveShop &&
-				cookies.includes(`beta_${effectiveShop.replace(/\./g, "_")}=true`);
-
-			// Verify beta status for any request with a beta cookie (expanded from page loads only)
-			// EXCEPTION: Don't verify for /_next/ assets - if they have a beta cookie and need Next.js assets,
-			// they're already on the beta app and need those assets to render. Verifying would break the page.
-			// NOTE: Use hasBetaCookieForEffectiveShop instead of hasShopBetaCookie for consistency
-			// hasShopBetaCookie depends on the shopify-shop cookie which is only set by Next.js,
-			// causing a timing asymmetry where verification is skipped on first request but triggers on subsequent ones
-			if (shouldUseBeta && hasBetaCookieForEffectiveShop && effectiveShop && !hasBetaFlag && !isNextAsset) {
-				console.log(`Beta cookie exists for ${effectiveShop}, verifying against database...`);
-				const dbBetaEnabled = await verifyBetaStatus(effectiveShop);
-
-				if (dbBetaEnabled === false) {
-					console.log(`Database says beta is DISABLED for ${effectiveShop}.`);
-
-					// Override beta flag - route to old app
-					shouldUseBeta = false;
-					shouldClearBetaCookie = true;
-
-					// For page loads, do a redirect with cache-busting to force browser to clear cached Next.js assets
-					if (isPageLoad) {
-						console.log(`Page load detected - redirecting to clear cache and cookie.`);
-						const cookieName = `beta_${effectiveShop.replace(/\./g, "_")}`;
-						const redirectUrl = new URL(url);
-						redirectUrl.searchParams.set('_nocache', Date.now().toString());
-						redirectUrl.searchParams.set('beta_disabled', 'true');
-
-						return new Response(null, {
-							status: 302,
-							headers: {
-								'Location': redirectUrl.toString(),
-								'Set-Cookie': `${cookieName}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; SameSite=None`,
-								'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
-								'Pragma': 'no-cache',
-								'Expires': '0'
-							}
-						});
-					}
-					// For API calls, just continue - we'll route to old app and clear cookie in response
-					console.log(`API call detected - routing to old app and will clear cookie in response.`);
-				} else if (dbBetaEnabled === true) {
-					console.log(`Database confirms beta is enabled for ${effectiveShop}.`);
+				if (cookieMatch) {
+					useNextjs = cookieMatch[1] === "nextjs";
+					console.log(`[Router] Cookie says ${cookieMatch[1]} for ${effectiveShop}`);
 				} else {
-					console.log(`Could not verify beta status for ${effectiveShop}, trusting cookie.`);
+					// Check for legacy beta cookie (backwards compatibility)
+					const legacyCookie = legacyBetaCookieName(effectiveShop);
+					if (cookies.includes(`${legacyCookie}=true`)) {
+						useNextjs = true;
+						console.log(`[Router] Legacy beta cookie found for ${effectiveShop}`);
+					} else {
+						// Priority 3: First visit - check database
+						const isPageLoad = url.pathname === "/" || url.pathname === "";
+						const isAsset = url.pathname.startsWith("/_next/") || url.pathname.startsWith("/_nuxt/");
+
+						if (isPageLoad && !isAsset) {
+							console.log(`[Router] First visit for ${effectiveShop}, checking database...`);
+
+							try {
+								const controller = new AbortController();
+								const timeoutId = setTimeout(() => controller.abort(), 2000);
+
+								const statusUrl = `https://app.getrecipekit.com/api/beta-status?shop=${encodeURIComponent(effectiveShop)}`;
+								const statusResponse = await fetch(statusUrl, {
+									headers: { "X-Forwarded-Host": "recipe-kit-router.recipekit.workers.dev" },
+									signal: controller.signal
+								});
+								clearTimeout(timeoutId);
+
+								if (statusResponse.ok) {
+									const data = await statusResponse.json();
+									if (data.beta_app_enabled === false) {
+										useNextjs = false;
+										cookieToSet = { shop: effectiveShop, value: "nuxt" };
+										console.log(`[Router] Database says Nuxt for ${effectiveShop}`);
+									} else {
+										cookieToSet = { shop: effectiveShop, value: "nextjs" };
+										console.log(`[Router] Database says Next.js for ${effectiveShop}`);
+									}
+								}
+							} catch (e) {
+								console.error(`[Router] Database check failed: ${e.message}`);
+								// Default to Next.js on error
+							}
+						}
+					}
 				}
 			}
 
-			// Check if request is embedded
-			const isEmbedded = url.searchParams.get("embedded") === "1";
+			// ====================================================================
+			// STEP 2: SPECIAL CASES
+			// ====================================================================
+
+			// Installation flows always use Nuxt (OAuth lives there)
 			const hasIdToken = url.searchParams.has("id_token");
 			const isInstallationFlow = hasIdToken && (url.pathname === "/" || url.pathname === "/auth");
-			
-			// Special case: /auth endpoint with host parameter is also considered embedded for OAuth flow
-			const isAuthWithHost = url.pathname === "/auth" && url.searchParams.has("host");
-
-			// Always defer embedded installation flows to the legacy Nuxt app, even for beta users
-			// BUT only for actual installation flows (with id_token), not for regular embedded usage
-			// EXCEPTION: If beta_enabled=true is in the URL, this is a beta enablement, not an installation
-			if (isEmbedded && isInstallationFlow && !hasBetaFlag) {
-				if (shouldUseBeta) {
-					console.log(`Embedded installation flow detected for shop: ${effectiveShop}. Forcing legacy app for OAuth.`);
-				}
-				shouldUseBeta = false;
+			if (isEmbedded && isInstallationFlow && !urlWantsNextjs) {
+				useNextjs = false;
+				console.log(`[Router] Installation flow - forcing Nuxt`);
 			}
 
-			// Ignore old beta_user cookie - it's deprecated
-
-			// SAFETY: Only proxy specific paths for beta users
-			const allowedBetaPaths = [
-				"/",
-				"/api/",
-				"/recipe", // Next.js recipe pages (singular - create, edit, generate)
-				"/recipes", // Recipe listing and API
-				"/settings",
-				"/analytics",
-				"/addons",
-				"/onboarding",
-				"/plan", // Billing/plan page
-				"/install", // Installation pages
-				"/_next/" // Next.js assets
-				// Note: /_nuxt/ is handled specially and always goes to old app
-			];
-
-			const isAllowedPath = allowedBetaPaths.some((path) => url.pathname === path || url.pathname.startsWith(path));
-
-			// Backend API paths that need special routing for beta users
-			// Note: /recipe (singular) is for Next.js pages, /recipes (plural) is for API
-			// IMPORTANT: /analytics/enable is OAuth callback - must go to Nuxt app, not backend
-			const backendApiPaths = [
-				"/recipes",
-				"/generate", // Recipe generation endpoint
-				// "/analytics", // Removed - analytics/enable OAuth callback needs Nuxt app
-				"/shop",
-				"/blogs",
-				"/articles",
-				"/functions",
-				"/resources",
-				"/install",
-				"/billing",
-				"/auth",
-				"/api/apps" // Add this for the apps endpoint
-			];
-			
-			// Special handling for analytics routes
-			// /analytics/enable is OAuth callback - goes to Nuxt app  
-			// Other /analytics/* routes can go to backend for data fetching
-			// IMPORTANT: isBackendApi should only be true for beta users!
-			// Non-beta users should have ALL requests go to the Nuxt app
-			let isBackendApi = false;
-			
-			// Only set isBackendApi for BETA users
-			if (shouldUseBeta) {
-				isBackendApi = backendApiPaths.some((path) => url.pathname.startsWith(path));
-				
-				// Analytics routing: Data fetching endpoints can go to backend
-				// OAuth-related endpoints (/analytics/enable, /analytics/scopes) stay in Nuxt (handled by legacyOnlyPaths)
-				if (url.pathname.startsWith("/analytics") && 
-					!url.pathname.startsWith("/analytics/enable") &&
-					!url.pathname.startsWith("/analytics/scopes")) {
-					// These analytics endpoints are for data fetching and can go to backend
-					if (url.pathname.startsWith("/analytics/recipes") || 
-						url.pathname.startsWith("/analytics/collect") ||
-						url.pathname.startsWith("/analytics/attribution") ||
-						url.pathname.startsWith("/analytics/summary") ||
-						url.pathname.startsWith("/analytics/roi") ||
-						url.pathname.startsWith("/analytics/latest-analysis") ||
-						url.pathname.startsWith("/analytics/disable") ||
-						url.pathname.match(/^\/analytics\/[^\/]+$/)) {
-						isBackendApi = true;
-					}
-				}
-			}
-
-			// Determine target based on beta status and path type
-			let targetUrl;
-
-			// Check if this is a static asset (images, fonts, etc)
-			const staticAssetExtensions = [".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".woff", ".woff2", ".ttf", ".eot"];
-			const isStaticAsset =
-				staticAssetExtensions.some((ext) => url.pathname.toLowerCase().endsWith(ext)) ||
-				url.pathname.startsWith("/cdn-") ||
-				url.pathname.includes("/fonts/");
-
-			// PRIORITY: The Nuxt app is production - it takes priority over Next.js beta
-			// These endpoints MUST stay on the Nuxt app for reliability
-			// When in doubt, route to Nuxt app to ensure existing customers aren't affected
+			// Legacy-only paths (OAuth, billing, etc.)
 			const legacyOnlyPaths = [
-				"/create_charge",
-				"/auth",
-				"/auth/callback",
-				"/auth_redirect",
-				"/access_check_middleware",
-				"/install",
-				"/api/user-preferences", // Old app checks beta status
-				"/analytics/enable", // OAuth callback handler only exists in Nuxt app
-				"/analytics/scopes" // OAuth initiation should also stay in Nuxt for consistency
+				"/create_charge", "/auth", "/auth/callback", "/auth_redirect",
+				"/access_check_middleware", "/install", "/api/user-preferences",
+				"/analytics/enable", "/analytics/scopes"
 			];
-			const isLegacyOnlyPath = legacyOnlyPaths.some((path) => url.pathname === path || url.pathname.startsWith(`${path}/`));
+			const isLegacyOnly = legacyOnlyPaths.some(p => url.pathname === p || url.pathname.startsWith(`${p}/`));
 
-			// SPECIAL CASE: /_nuxt/ assets ALWAYS go to old app regardless of beta status
-			if (url.pathname.startsWith("/_nuxt/")) {
-				console.log(`Routing Nuxt asset to old app: ${url.pathname}`);
+			// ====================================================================
+			// STEP 3: DETERMINE TARGET URL
+			// ====================================================================
+
+			let targetUrl;
+			const isNextAsset = url.pathname.startsWith("/_next/");
+			const isNuxtAsset = url.pathname.startsWith("/_nuxt/");
+			const isStaticAsset = [".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".woff", ".woff2", ".ttf", ".eot"]
+				.some(ext => url.pathname.toLowerCase().endsWith(ext));
+
+			// Allowed paths for Next.js
+			const allowedNextPaths = ["/", "/api/", "/recipe", "/recipes", "/settings", "/analytics",
+			                          "/addons", "/onboarding", "/plan", "/install", "/_next/"];
+			const isAllowedPath = allowedNextPaths.some(p => url.pathname === p || url.pathname.startsWith(p));
+
+			// Backend API paths (go to Express server for Next.js users)
+			const backendApiPaths = ["/recipes", "/generate", "/shop", "/blogs", "/articles",
+			                         "/functions", "/resources", "/install", "/billing", "/auth", "/api/apps"];
+			const isBackendApi = useNextjs && backendApiPaths.some(p => url.pathname.startsWith(p));
+
+			// Analytics data endpoints (not OAuth) can go to backend
+			const isAnalyticsData = useNextjs && url.pathname.startsWith("/analytics") &&
+				!url.pathname.startsWith("/analytics/enable") && !url.pathname.startsWith("/analytics/scopes");
+
+			if (isNuxtAsset) {
 				targetUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
-			}
-			// SPECIAL CASE: /_next/ assets go to Next.js app IF there's any beta indication
-			// We check shouldUseBeta OR hasAnyBetaCookie because:
-			// 1. Safari's ITP blocks SameSite=None cookies in embedded iframes
-			// 2. hasAnyBetaCookie catches cases where shop-specific matching fails
-			// 3. Without either, we default to Nuxt app (principle: default to production)
-			else if (url.pathname.startsWith("/_next/") && (shouldUseBeta || hasAnyBetaCookie)) {
-				console.log(`Routing Next.js asset to Next.js app: ${url.pathname} (shouldUseBeta=${shouldUseBeta}, hasAnyBetaCookie=${hasAnyBetaCookie})`);
+			} else if (isNextAsset && useNextjs) {
 				targetUrl = `https://app.recipekit.com${url.pathname}${url.search}`;
-			}
-			// Static assets (images, fonts, CDN paths, etc) should go to old app where they're hosted
-			else if (isLegacyOnlyPath) {
-				console.log(`Routing legacy-only endpoint to old app: ${url.pathname}`);
+			} else if (isLegacyOnly || isStaticAsset) {
 				targetUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
-			} else if (isStaticAsset) {
-				console.log(`Routing static asset to old app: ${url.pathname}`);
-				targetUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
-			} else if (shouldUseBeta && isAllowedPath) {
-				// Beta user - route to new infrastructure
-				if (isBackendApi) {
-					// API calls go to Express backend
-					console.log(`BETA USER - Routing API to backend: ${url.pathname}`);
-					// Add shop parameter if not already present (required for proxied auth)
-					const targetUrlObj = new URL(`https://recipe-kit-next-server.onrender.com${url.pathname}${url.search}`);
-					if (!targetUrlObj.searchParams.has('shop') && shopForRouting) {
-						targetUrlObj.searchParams.set('shop', shopForRouting);
+			} else if (useNextjs && isAllowedPath) {
+				if (isBackendApi || isAnalyticsData) {
+					const apiUrl = new URL(`https://recipe-kit-next-server.onrender.com${url.pathname}${url.search}`);
+					if (!apiUrl.searchParams.has('shop') && effectiveShop) {
+						apiUrl.searchParams.set('shop', effectiveShop);
 					}
-					targetUrl = targetUrlObj.toString();
+					targetUrl = apiUrl.toString();
 				} else {
-					// Frontend routes go to Next.js app
-					console.log(`BETA USER - Routing to Next.js frontend: ${url.pathname}`);
 					targetUrl = `https://app.recipekit.com${url.pathname}${url.search}`;
 				}
-			} else if (shouldUseBeta && !isAllowedPath) {
-				// Beta user accessing non-allowed path - still route to old app
-				console.log(`BETA USER - Non-allowed path (${url.pathname}), routing to old app`);
-				console.log(`Path not in allowed list. isAllowedPath=${isAllowedPath}`);
-				targetUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
 			} else {
-				console.log(`NORMAL USER - Routing to old app for path: ${url.pathname}, shop: ${effectiveShop}, beta: ${shouldUseBeta}`);
-				// Route to OLD Nuxt app (it handles its own frontend + API)
 				targetUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
 			}
 
-			// Build the proxied request - create new headers to avoid conflicts
-			const newHeaders = new Headers(request.headers);
+			console.log(`[Router] ${effectiveShop || 'unknown'} -> ${useNextjs ? 'Next.js' : 'Nuxt'} (${url.pathname})`);
 
-			// Extract host from target URL
-			const targetHost = new URL(targetUrl).hostname;
+			// ====================================================================
+			// STEP 4: PROXY THE REQUEST
+			// ====================================================================
 
-			// Set proper Host header for the target
-			newHeaders.set("Host", targetHost);
+			const proxyHeaders = new Headers(request.headers);
+			proxyHeaders.set("Host", new URL(targetUrl).hostname);
+			proxyHeaders.set("X-Forwarded-Host", "recipe-kit-router.recipekit.workers.dev");
+			proxyHeaders.set("X-Forwarded-Proto", "https");
 
-			// Add forwarding headers - preserve the worker domain as the host
-			// This is important for App Bridge to recognize the correct origin
-			newHeaders.set("X-Forwarded-Host", "recipe-kit-router.recipekit.workers.dev");
-			newHeaders.set("X-Forwarded-Proto", "https");
-			newHeaders.set("X-Original-Path", url.pathname);
-			newHeaders.set("X-Original-URL", url.toString());
-			
-			// Simple debug logging without interfering with headers
-			if (isBackendApi) {
-				console.log(`[Worker] API request to ${url.pathname} -> ${targetUrl}`);
-				console.log(`[Worker] Has Authorization: ${newHeaders.has('Authorization')}, Beta: ${shouldUseBeta}`);
+			if (useNextjs) {
+				proxyHeaders.set("X-Worker-Secret", env.WORKER_SECRET || "development-secret-change-me");
 			}
 
-			// Add secret for new app authentication (only beta app uses this)
-			if (shouldUseBeta) {
-				newHeaders.set("X-Worker-Secret", env.WORKER_SECRET || "development-secret-change-me");
-			}
-
-			// For embedded requests, we need to follow redirects to get the actual content
-			// For non-embedded, we keep manual to preserve redirect behavior
-			// Note: isEmbedded is already declared earlier in the code
-
-			// Don't follow redirects - we need to handle OAuth flow specially
-			const modifiedRequest = new Request(targetUrl, {
+			const proxyRequest = new Request(targetUrl, {
 				method: request.method,
-				headers: newHeaders,
+				headers: proxyHeaders,
 				body: requestBody,
 				redirect: "manual"
 			});
 
-			// Set timeout for request (fallback if slow)
 			const controller = new AbortController();
-			const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout for embedded
+			const timeoutId = setTimeout(() => controller.abort(), 10000);
 
-			try {
-				let response = await fetch(modifiedRequest, {
-					signal: controller.signal
-				});
+			let response = await fetch(proxyRequest, { signal: controller.signal });
+			clearTimeout(timeoutId);
 
-				clearTimeout(timeoutId);
-				
-				console.log(`Response from ${targetUrl}: status=${response.status}, embedded=${isEmbedded}, content-length=${response.headers.get('content-length')}`);
-				
-				// Special handling for /auth endpoint in embedded context
-				// The /auth endpoint returns HTML with JavaScript that tries to redirect,
-				// but Chrome blocks top-level navigation from iframes
-				if (url.pathname === '/auth' && response.status === 200 && (isEmbedded || isAuthWithHost)) {
-					console.log('[Worker] Detected /auth endpoint response in embedded context');
-					
-					// Parse the OAuth URL from the response body
-					const responseText = await response.text();
-					
-					// Look for the permission URL in the JavaScript
-					const permissionUrlMatch = responseText.match(/const permissionUrl = '([^']+)'/);
-					let oauthUrl = null;
-					
-					if (permissionUrlMatch) {
-						oauthUrl = permissionUrlMatch[1];
-						console.log('[Worker] Extracted OAuth URL from permissionUrl variable:', oauthUrl);
-					} else {
-						// Fallback: try to match the URL pattern directly
-						const oauthMatch = responseText.match(/https:\/\/[^\/]+\/admin\/oauth\/authorize\?[^'"\s]+/);
-						if (oauthMatch) {
-							oauthUrl = oauthMatch[0];
-							console.log('[Worker] Extracted OAuth URL via pattern match:', oauthUrl);
-						}
-					}
-					
-					if (oauthUrl) {
-						console.log('[Worker] Returning server-side 302 redirect to OAuth URL');
-						
-						// Return a proper HTTP redirect instead of HTML with JavaScript
-						// This will work in embedded context where JavaScript redirects are blocked
-						return new Response(null, {
-							status: 302,
-							headers: {
-								'Location': oauthUrl,
-								'Content-Type': 'text/plain'
-							}
-						});
-					} else {
-						console.error('[Worker] Could not extract OAuth URL from /auth response');
-						console.error('[Worker] Response text sample:', responseText.substring(0, 500));
-						// Fall through to normal response handling
-						response = new Response(responseText, response);
-					}
+			// ====================================================================
+			// STEP 5: HANDLE SPECIAL RESPONSES
+			// ====================================================================
+
+			// Handle /auth OAuth redirect extraction for embedded context
+			const isAuthWithHost = url.pathname === "/auth" && url.searchParams.has("host");
+			if (url.pathname === '/auth' && response.status === 200 && (isEmbedded || isAuthWithHost)) {
+				const text = await response.text();
+				const oauthMatch = text.match(/const permissionUrl = '([^']+)'/) ||
+				                   text.match(/https:\/\/[^\/]+\/admin\/oauth\/authorize\?[^'"\s]+/);
+				if (oauthMatch) {
+					const oauthUrl = oauthMatch[1] || oauthMatch[0];
+					return new Response(null, { status: 302, headers: { 'Location': oauthUrl } });
 				}
+				response = new Response(text, response);
+			}
 
-				// Check if response is valid
-				if (shouldUseBeta && !response.ok && response.status >= 500) {
-					console.error(`Beta app error: ${response.status} - falling back to old app`);
-					throw new Error("Beta app returned error");
-				}
+			// Fallback to Nuxt on Next.js errors
+			if (useNextjs && !response.ok && response.status >= 500) {
+				console.error(`[Router] Next.js error ${response.status}, falling back to Nuxt`);
+				return await createFallbackResponse(url, request.method, request.headers, requestBody, effectiveShop, isEmbedded);
+			}
 
-				// Special handling for /api/user-preferences response
-				// If the database says beta is disabled but we have a beta cookie, clear it
-				if (url.pathname === '/api/user-preferences' && response.ok) {
+			// Handle redirects
+			if (response.status >= 300 && response.status < 400) {
+				const modified = new Response(response.body, response);
+				if (isEmbedded) setCSPHeaders(modified, effectiveShop);
+
+				// Rewrite internal redirects to stay on worker domain
+				const location = response.headers.get("Location");
+				if (!isEmbedded && location) {
 					try {
-						const responseClone = response.clone();
-						const prefsData = await responseClone.json();
-
-						if (prefsData.beta_app_enabled === false && effectiveShop) {
-							const cookieName = `beta_${effectiveShop.replace(/\./g, "_")}`;
-							const hasBetaCookie = cookies.includes(`${cookieName}=true`);
-
-							if (hasBetaCookie) {
-								console.log(`Database says beta disabled for ${effectiveShop}, but cookie exists. Clearing cookie.`);
-								// We need to modify the response to include the Set-Cookie header
-								const modifiedPrefsResponse = new Response(JSON.stringify(prefsData), response);
-								modifiedPrefsResponse.headers.set("Content-Type", "application/json");
-								modifiedPrefsResponse.headers.append("Set-Cookie", `${cookieName}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; SameSite=None`);
-
-								if (isEmbedded) {
-									modifiedPrefsResponse.headers.set(
-										"Content-Security-Policy",
-										`frame-ancestors https://${shopForRouting} https://admin.shopify.com;`
-									);
-									modifiedPrefsResponse.headers.delete("X-Frame-Options");
-									modifiedPrefsResponse.headers.delete("x-frame-options");
-								}
-
-								return modifiedPrefsResponse;
-							}
+						const locUrl = new URL(location);
+						if (locUrl.hostname === "app.recipekit.com" || locUrl.hostname === "app.getrecipekit.com") {
+							modified.headers.set("Location", locUrl.pathname + locUrl.search + locUrl.hash);
 						}
-					} catch (jsonError) {
-						console.error("Failed to parse user-preferences response:", jsonError);
-						// Continue with normal response handling
-					}
+					} catch (e) { /* Invalid URL, leave as-is */ }
 				}
-				
-				// Handle redirects - just pass them through with proper CSP
-				if (response.status >= 300 && response.status < 400) {
-					const location = response.headers.get("Location");
-					console.log(`Redirect detected: ${location}, embedded: ${isEmbedded}`);
-					
-					const redirectResponse = new Response(response.body, response);
-					
-					// For embedded apps, ensure CSP is set
-					if (isEmbedded) {
-						redirectResponse.headers.set(
-							"Content-Security-Policy",
-							`frame-ancestors https://${shop || effectiveShop} https://admin.shopify.com;`
-						);
-						redirectResponse.headers.delete("X-Frame-Options");
-						redirectResponse.headers.delete("x-frame-options");
-					}
-					
-					// For non-embedded, rewrite location to stay on worker domain  
-					if (!isEmbedded && location) {
-						// Rewrite location to stay on worker domain
-						let newLocation = location;
-						if (location.startsWith("https://app.recipekit.com")) {
-							newLocation = location.replace("https://app.recipekit.com", "");
-						} else if (location.startsWith("https://app.getrecipekit.com")) {
-							newLocation = location.replace("https://app.getrecipekit.com", "");
-						}
-						
-						if (newLocation !== location) {
-							console.log(`Rewriting redirect from ${location} to ${newLocation}`);
-							redirectResponse.headers.set("Location", newLocation);
-						}
-					}
-					
-					return redirectResponse;
-				}
-
-				// Clone and modify response
-				const modifiedResponse = new Response(response.body, response);
-				
-				// For embedded apps, ensure proper CSP headers
-				if (isEmbedded) {
-					// Set CSP for embedding - don't delete existing, just override
-					modifiedResponse.headers.set(
-						"Content-Security-Policy",
-						`frame-ancestors https://${shopForRouting} https://admin.shopify.com;`
-					);
-					modifiedResponse.headers.delete("X-Frame-Options");
-					modifiedResponse.headers.delete("x-frame-options");
-				}
-
-				// Handle beta cookies based on flags
-				if (effectiveShop) {
-					const cookieName = `beta_${effectiveShop.replace(/\./g, "_")}`;
-
-					// Clear beta cookie if beta is explicitly disabled OR if database says it's disabled
-					if (hasBetaDisableFlag || shouldClearBetaCookie) {
-						console.log(`Clearing beta cookie for shop: ${effectiveShop} (${hasBetaDisableFlag ? 'explicitly disabled' : 'database override'})`);
-						// Set cookie with Max-Age=0 to delete it
-						modifiedResponse.headers.append("Set-Cookie", `${cookieName}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; SameSite=None`);
-					}
-					// Set beta cookie ONLY if beta was explicitly enabled via URL flag
-					else if (shouldUseBeta && hasBetaFlag) {
-						if (!cookies.includes(`${cookieName}=true`)) {
-							console.log(`Setting beta cookie for shop: ${effectiveShop} (explicitly enabled via URL flag)`);
-							modifiedResponse.headers.append("Set-Cookie", `${cookieName}=true; Path=/; Secure; SameSite=None; Max-Age=2592000`);
-						}
-					}
-				}
-
-				return modifiedResponse;
-			} catch (betaError) {
-				// SAFETY: If beta request fails, fall back to old app
-				if (shouldUseBeta) {
-					console.error("Beta proxy failed, falling back to old app:", betaError.message);
-
-					// Try to serve old app instead
-					const fallbackUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
-					const fallbackRequest = new Request(fallbackUrl, {
-						method: request.method,
-						headers: request.headers,
-						body: requestBody
-					});
-
-					const fallbackResponse = await fetch(fallbackRequest);
-					const modifiedFallback = new Response(fallbackResponse.body, fallbackResponse);
-
-					if (isEmbedded) {
-						modifiedFallback.headers.set(
-							"Content-Security-Policy",
-							`frame-ancestors https://${shop || effectiveShop} https://admin.shopify.com;`
-						);
-						modifiedFallback.headers.delete("X-Frame-Options");
-						modifiedFallback.headers.delete("x-frame-options");
-					}
-
-					// Clear beta cookie to prevent repeated failures
-					modifiedFallback.headers.append("Set-Cookie", "beta_user=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
-
-					return modifiedFallback;
-				}
-
-				throw betaError;
+				return modified;
 			}
+
+			// ====================================================================
+			// STEP 6: BUILD FINAL RESPONSE
+			// ====================================================================
+
+			const finalResponse = new Response(response.body, response);
+
+			if (isEmbedded) setCSPHeaders(finalResponse, effectiveShop);
+
+			// Set routing cookie if needed
+			if (cookieToSet) {
+				const cookieName = shopToCookieName(cookieToSet.shop);
+				finalResponse.headers.append("Set-Cookie",
+					`${cookieName}=${cookieToSet.value}; Path=/; Secure; SameSite=None; Max-Age=2592000`);
+
+				// Clear legacy cookies
+				const legacyCookie = legacyBetaCookieName(cookieToSet.shop);
+				finalResponse.headers.append("Set-Cookie",
+					`${legacyCookie}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; SameSite=None`);
+			}
+
+			return finalResponse;
+
 		} catch (error) {
-			// ULTIMATE SAFETY: If anything fails, serve the old app
-			console.error("Worker error, serving old app:", error);
-
-			const fallbackUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
-			
-			const fallbackRequest = new Request(fallbackUrl, {
-				method: request.method,
-				headers: request.headers,
-				body: requestBody
-			});
-
-			const fallbackResponse = await fetch(fallbackRequest);
-			const modifiedFallback = new Response(fallbackResponse.body, fallbackResponse);
-
-			if (isEmbedded) {
-				modifiedFallback.headers.set(
-					"Content-Security-Policy",
-					`frame-ancestors https://${shop || effectiveShop} https://admin.shopify.com;`
-				);
-				modifiedFallback.headers.delete("X-Frame-Options");
-				modifiedFallback.headers.delete("x-frame-options");
-			}
-
-			return modifiedFallback;
+			// Ultimate fallback: serve Nuxt on any error
+			console.error("[Router] Error, falling back to Nuxt:", error);
+			return await createFallbackResponse(url, request.method, request.headers, requestBody, effectiveShop, isEmbedded);
 		}
 	}
 };
