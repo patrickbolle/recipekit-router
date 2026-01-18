@@ -141,9 +141,10 @@ export default {
 			}
 
 			// Legacy-only paths (OAuth, billing, etc.)
+			// Note: /api/user-preferences removed - Next.js handles it now
 			const legacyOnlyPaths = [
 				"/create_charge", "/auth", "/auth/callback", "/auth_redirect",
-				"/access_check_middleware", "/install", "/api/user-preferences",
+				"/access_check_middleware", "/install",
 				"/analytics/enable", "/analytics/scopes"
 			];
 			const isLegacyOnly = legacyOnlyPaths.some(p => url.pathname === p || url.pathname.startsWith(`${p}/`));
