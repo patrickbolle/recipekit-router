@@ -119,40 +119,11 @@ export default {
 						useNextjs = true;
 						console.log(`[Router] Legacy beta cookie found for ${effectiveShop}`);
 					} else {
-						// Priority 3: First visit - check database
-						const isPageLoad = url.pathname === "/" || url.pathname === "";
-						const isAsset = url.pathname.startsWith("/_next/") || url.pathname.startsWith("/_nuxt/");
-
-						if (isPageLoad && !isAsset) {
-							console.log(`[Router] First visit for ${effectiveShop}, checking database...`);
-
-							try {
-								const controller = new AbortController();
-								const timeoutId = setTimeout(() => controller.abort(), 2000);
-
-								const statusUrl = `https://app.getrecipekit.com/api/beta-status?shop=${encodeURIComponent(effectiveShop)}`;
-								const statusResponse = await fetch(statusUrl, {
-									headers: { "X-Forwarded-Host": "recipe-kit-router.recipekit.workers.dev" },
-									signal: controller.signal
-								});
-								clearTimeout(timeoutId);
-
-								if (statusResponse.ok) {
-									const data = await statusResponse.json();
-									if (data.beta_app_enabled === false) {
-										useNextjs = false;
-										cookieToSet = { shop: effectiveShop, value: "nuxt" };
-										console.log(`[Router] Database says Nuxt for ${effectiveShop}`);
-									} else {
-										cookieToSet = { shop: effectiveShop, value: "nextjs" };
-										console.log(`[Router] Database says Next.js for ${effectiveShop}`);
-									}
-								}
-							} catch (e) {
-								console.error(`[Router] Database check failed: ${e.message}`);
-								// Default to Next.js on error
-							}
-						}
+						// Priority 3: First visit - default to Next.js
+						// Note: We no longer check the database. The old beta_app_enabled field
+						// was for opt-IN to beta. Now Next.js is the default, so everyone gets it
+						// unless they explicitly opt out via ?use_nuxt=true
+						console.log(`[Router] First visit for ${effectiveShop}, defaulting to Next.js`);
 					}
 				}
 			}
