@@ -121,7 +121,7 @@ export default {
 			// OAuth paths must stay on Nuxt (Next.js auth redirect URLs not configured for production)
 			const legacyOnlyPaths = [
 				"/auth", "/auth/callback", "/auth_redirect",
-				"/create_charge", "/access_check_middleware"
+				"/create_charge"
 			];
 			const isLegacyOnly = legacyOnlyPaths.some(p => url.pathname === p || url.pathname.startsWith(`${p}/`));
 
