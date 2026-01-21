@@ -1,15 +1,16 @@
 // Cloudflare Worker for RecipeKit
-// Routes traffic between Next.js (primary) and Nuxt (legacy) apps
+// Routes traffic to Next.js app (fully migrated from legacy Nuxt)
 //
-// ROUTING LOGIC (in priority order):
-// 1. URL flags (?use_nextjs=true or ?use_nuxt=true) - explicit override
-// 2. Routing cookie (routing_SHOP=nextjs|nuxt) - cached preference
-// 3. Default: Next.js (everyone gets Next.js unless they opt out)
+// Routing:
+// - Frontend pages → app.recipekit.com (Next.js)
+// - Backend API → recipe-kit-next-server.onrender.com (Express)
+// - OAuth paths → app.getrecipekit.com (Nuxt - auth redirects configured there)
 
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
+// Legacy cookie names - used for clearing old cookies
 const shopToCookieName = (shop) => shop ? `routing_${shop.replace(/\./g, "_")}` : null;
 const legacyBetaCookieName = (shop) => shop ? `beta_${shop.replace(/\./g, "_")}` : null;
 
@@ -28,14 +29,6 @@ const setCSPHeaders = (response, shop) => {
 	response.headers.delete("x-frame-options");
 };
 
-const createFallbackResponse = async (url, method, headers, body, shop, isEmbedded) => {
-	const fallbackUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
-	const response = await fetch(new Request(fallbackUrl, { method, headers, body }));
-	const modified = new Response(response.body, response);
-	if (isEmbedded) setCSPHeaders(modified, shop);
-	return modified;
-};
-
 // ============================================================================
 // MAIN HANDLER
 // ============================================================================
@@ -45,8 +38,7 @@ export default {
 		const url = new URL(request.url);
 		const cookies = request.headers.get("Cookie") || "";
 
-		// Clone request for POST/PUT/PATCH (may need for retry on fallback)
-		// Use arrayBuffer to preserve binary data (important for file uploads)
+		// Clone request body for POST/PUT/PATCH
 		let requestBody = null;
 		if (['POST', 'PUT', 'PATCH'].includes(request.method)) {
 			try {
@@ -70,122 +62,94 @@ export default {
 		}
 
 		// ========================================================================
-		// VARIABLES (declared here so they're accessible in catch block)
+		// EXTRACT SHOP DOMAIN
 		// ========================================================================
-		let shop = url.searchParams.get("shop") || "";
-		let shopFromCookie = cookies.match(/shopify-shop=([^;]+)/)?.[1] || null;
-		let effectiveShop = shop || shopFromCookie;
-		let isEmbedded = url.searchParams.get("embedded") === "1";
-		let useNextjs = true; // Default to Next.js - EVERYONE gets Next.js
-		let cookieToSet = null; // Track cookie changes
+		const shop = url.searchParams.get("shop") || "";
+		const shopFromCookie = cookies.match(/shopify-shop=([^;]+)/)?.[1] || null;
+		const effectiveShop = shop || shopFromCookie;
+		const isEmbedded = url.searchParams.get("embedded") === "1";
+
+		// Diagnostic logging for shop resolution issues
+		if (!effectiveShop && url.pathname !== "/" && !url.pathname.startsWith("/_next")) {
+			console.warn(`[Router] ⚠️ NO SHOP RESOLVED for ${url.pathname}`, {
+				shopFromQuery: shop || "(empty)",
+				shopFromCookie: shopFromCookie || "(no cookie)",
+				hasAuth: !!request.headers.get("authorization")
+			});
+		}
+
+		// Check for legacy cookies to clear
+		let legacyCookiesToClear = [];
+		if (effectiveShop) {
+			const routingCookie = shopToCookieName(effectiveShop);
+			const betaCookie = legacyBetaCookieName(effectiveShop);
+			if (cookies.includes(routingCookie) || cookies.includes(betaCookie)) {
+				legacyCookiesToClear = [routingCookie, betaCookie];
+				console.log(`[Router] Clearing legacy cookies for ${effectiveShop}`);
+			}
+		}
 
 		try {
 			// ====================================================================
-			// STEP 1: DETERMINE ROUTING PREFERENCE
-			// ====================================================================
-
-			// Priority 1: URL flags (explicit override)
-			const urlWantsNextjs = url.searchParams.get("beta_enabled") === "true" ||
-			                       url.searchParams.get("use_nextjs") === "true";
-			const urlWantsNuxt = url.searchParams.get("beta_enabled") === "false" ||
-			                     url.searchParams.get("beta_disabled") !== null ||
-			                     url.searchParams.get("use_nuxt") === "true";
-
-			if (urlWantsNuxt) {
-				useNextjs = false;
-				if (effectiveShop) cookieToSet = { shop: effectiveShop, value: "nuxt" };
-				console.log(`[Router] URL flag requests Nuxt for ${effectiveShop}`);
-			} else if (urlWantsNextjs) {
-				useNextjs = true;
-				if (effectiveShop) cookieToSet = { shop: effectiveShop, value: "nextjs" };
-				console.log(`[Router] URL flag requests Next.js for ${effectiveShop}`);
-			} else if (effectiveShop) {
-				// Priority 2: Check for routing cookie (ONLY nuxt cookie matters now)
-				const cookieName = shopToCookieName(effectiveShop);
-				const cookieMatch = cookies.match(new RegExp(`${cookieName}=(nextjs|nuxt)`));
-
-				if (cookieMatch && cookieMatch[1] === "nuxt") {
-					// Only respect explicit nuxt opt-out
-					useNextjs = false;
-					console.log(`[Router] Cookie says nuxt for ${effectiveShop}`);
-				} else {
-					// Default to Next.js for everyone
-					console.log(`[Router] Defaulting to Next.js for ${effectiveShop}`);
-				}
-			}
-
-			// ====================================================================
-			// STEP 2: SPECIAL CASES - OAuth paths MUST stay on Nuxt
-			// ====================================================================
-
-			// OAuth paths must stay on Nuxt (Next.js auth redirect URLs not configured for production)
-			const legacyOnlyPaths = [
-				"/auth", "/auth/callback", "/auth_redirect",
-				"/create_charge"
-			];
-			const isLegacyOnly = legacyOnlyPaths.some(p => url.pathname === p || url.pathname.startsWith(`${p}/`));
-
-			// ====================================================================
-			// STEP 3: DETERMINE TARGET URL
+			// DETERMINE TARGET URL
 			// ====================================================================
 
 			let targetUrl;
 			const isNextAsset = url.pathname.startsWith("/_next/");
-			const isNuxtAsset = url.pathname.startsWith("/_nuxt/");
 			const isStaticAsset = [".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".woff", ".woff2", ".ttf", ".eot"]
 				.some(ext => url.pathname.toLowerCase().endsWith(ext));
 
-			// Allowed paths for Next.js
-			const allowedNextPaths = ["/", "/api/", "/recipe", "/recipes", "/settings", "/analytics",
-			                          "/addons", "/onboarding", "/plan", "/install", "/_next/"];
-			const isAllowedPath = allowedNextPaths.some(p => url.pathname === p || url.pathname.startsWith(p));
+			// OAuth paths still go to Nuxt (auth redirect URLs configured there)
+			const oauthPaths = ["/auth", "/auth/callback", "/auth_redirect", "/create_charge"];
+			const isOAuthPath = oauthPaths.some(p => url.pathname === p || url.pathname.startsWith(`${p}/`));
 
-			// Backend API paths (go to Express server for Next.js users)
+			// Backend API paths (go to Express server)
 			const backendApiPaths = ["/recipes", "/generate", "/shop", "/blogs", "/articles",
-			                         "/functions", "/resources", "/install", "/billing", "/auth", "/api/apps"];
-			const isBackendApi = useNextjs && backendApiPaths.some(p => url.pathname.startsWith(p));
+			                         "/functions", "/resources", "/install", "/billing", "/rating",
+			                         "/article-tags", "/api/apps"];
+			const isBackendApi = backendApiPaths.some(p => url.pathname.startsWith(p));
 
-			// Analytics API endpoints go to backend, but /analytics page goes to Next.js
-			// /analytics (exact) = page request → Next.js
-			// /analytics/* (with path segments like /dashboard/:shop) = API → Express
-			const isAnalyticsApi = useNextjs && url.pathname.startsWith("/analytics/") &&
+			// Analytics API endpoints go to backend (but /analytics page goes to Next.js)
+			const isAnalyticsApi = url.pathname.startsWith("/analytics/") &&
 				!url.pathname.startsWith("/analytics/enable") && !url.pathname.startsWith("/analytics/scopes");
-			// Note: /analytics (exact match, no trailing content) is NOT an API - it's the page
 
-			if (isNuxtAsset) {
+			if (isOAuthPath) {
+				// OAuth still on Nuxt
 				targetUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
-			} else if (isNextAsset && useNextjs) {
-				targetUrl = `https://app.recipekit.com${url.pathname}${url.search}`;
-			} else if (isLegacyOnly || isStaticAsset) {
-				targetUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
-			} else if (useNextjs && isAllowedPath) {
-				if (isBackendApi || isAnalyticsApi) {
-					const apiUrl = new URL(`https://recipe-kit-next-server.onrender.com${url.pathname}${url.search}`);
-					if (!apiUrl.searchParams.has('shop') && effectiveShop) {
-						apiUrl.searchParams.set('shop', effectiveShop);
-					}
-					targetUrl = apiUrl.toString();
-				} else {
-					targetUrl = `https://app.recipekit.com${url.pathname}${url.search}`;
+			} else if (isBackendApi || isAnalyticsApi) {
+				// API requests go to Express backend
+				const apiUrl = new URL(`https://recipe-kit-next-server.onrender.com${url.pathname}${url.search}`);
+				if (!apiUrl.searchParams.has('shop') && effectiveShop) {
+					apiUrl.searchParams.set('shop', effectiveShop);
 				}
-			} else {
+				// Log when API request goes out without shop parameter
+				if (!apiUrl.searchParams.has('shop')) {
+					console.error(`[Router] ❌ API REQUEST WITHOUT SHOP: ${url.pathname}`, {
+						effectiveShop: effectiveShop || "(none)",
+						method: request.method,
+						hasAuth: !!request.headers.get("authorization")
+					});
+				}
+				targetUrl = apiUrl.toString();
+			} else if (isStaticAsset && !isNextAsset) {
+				// Static assets from Nuxt (legacy)
 				targetUrl = `https://app.getrecipekit.com${url.pathname}${url.search}`;
+			} else {
+				// Everything else goes to Next.js
+				targetUrl = `https://app.recipekit.com${url.pathname}${url.search}`;
 			}
 
-			console.log(`[Router] ${effectiveShop || 'unknown'} -> ${useNextjs ? 'Next.js' : 'Nuxt'} (${url.pathname})`);
+			console.log(`[Router] ${effectiveShop || 'unknown'} -> ${url.pathname}`);
 
 			// ====================================================================
-			// STEP 4: PROXY THE REQUEST
+			// PROXY THE REQUEST
 			// ====================================================================
 
 			const proxyHeaders = new Headers(request.headers);
 			proxyHeaders.set("Host", new URL(targetUrl).hostname);
 			proxyHeaders.set("X-Forwarded-Host", "recipe-kit-router.recipekit.workers.dev");
 			proxyHeaders.set("X-Forwarded-Proto", "https");
-
-			if (useNextjs) {
-				proxyHeaders.set("X-Worker-Secret", env.WORKER_SECRET || "development-secret-change-me");
-			}
+			proxyHeaders.set("X-Worker-Secret", env.WORKER_SECRET || "development-secret-change-me");
 
 			const proxyRequest = new Request(targetUrl, {
 				method: request.method,
@@ -201,7 +165,7 @@ export default {
 			clearTimeout(timeoutId);
 
 			// ====================================================================
-			// STEP 5: HANDLE SPECIAL RESPONSES
+			// HANDLE SPECIAL RESPONSES
 			// ====================================================================
 
 			// Handle /auth OAuth redirect extraction for embedded context
@@ -215,12 +179,6 @@ export default {
 					return new Response(null, { status: 302, headers: { 'Location': oauthUrl } });
 				}
 				response = new Response(text, response);
-			}
-
-			// Fallback to Nuxt on Next.js errors
-			if (useNextjs && !response.ok && response.status >= 500) {
-				console.error(`[Router] Next.js error ${response.status}, falling back to Nuxt`);
-				return await createFallbackResponse(url, request.method, request.headers, requestBody, effectiveShop, isEmbedded);
 			}
 
 			// Handle redirects
@@ -242,31 +200,28 @@ export default {
 			}
 
 			// ====================================================================
-			// STEP 6: BUILD FINAL RESPONSE
+			// BUILD FINAL RESPONSE
 			// ====================================================================
 
 			const finalResponse = new Response(response.body, response);
 
 			if (isEmbedded) setCSPHeaders(finalResponse, effectiveShop);
 
-			// Set routing cookie if needed
-			if (cookieToSet) {
-				const cookieName = shopToCookieName(cookieToSet.shop);
+			// Clear any legacy routing cookies
+			for (const cookieName of legacyCookiesToClear) {
 				finalResponse.headers.append("Set-Cookie",
-					`${cookieName}=${cookieToSet.value}; Path=/; Secure; SameSite=None; Max-Age=2592000`);
-
-				// Clear legacy cookies
-				const legacyCookie = legacyBetaCookieName(cookieToSet.shop);
-				finalResponse.headers.append("Set-Cookie",
-					`${legacyCookie}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; SameSite=None`);
+					`${cookieName}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; SameSite=None`);
 			}
 
 			return finalResponse;
 
 		} catch (error) {
-			// Ultimate fallback: serve Nuxt on any error
-			console.error("[Router] Error, falling back to Nuxt:", error);
-			return await createFallbackResponse(url, request.method, request.headers, requestBody, effectiveShop, isEmbedded);
+			console.error("[Router] Error:", error);
+			// Return error response instead of fallback
+			return new Response(JSON.stringify({ error: "Router error", message: error.message }), {
+				status: 502,
+				headers: { "Content-Type": "application/json" }
+			});
 		}
 	}
 };
